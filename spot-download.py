@@ -3,99 +3,135 @@ import os
 import requests
 import time
 import concurrent.futures
+import subprocess
 
 # --- Configuration ---
 JSONL_FILE_PATH = 'spotify_podcast_data.jsonl'  # 👈 Update this path
-DOWNLOAD_DIRECTORY = 'spotify_podcasts_log'
-LOG_FILE = os.path.join(DOWNLOAD_DIRECTORY, 'simulation_log.txt')
-MAX_WORKERS = 20  # 👈 1. Number of parallel threads. Start small (e.g., 10) and increase carefully.
-headers = {
+# Directory where the final, converted audio files will be saved
+DOWNLOAD_DIRECTORY = 'downloads'
+# Log file to track successfully downloaded and converted episodes
+LOG_FILE = os.path.join(DOWNLOAD_DIRECTORY, 'download_log.txt')
+
+# Number of parallel download/conversion threads.
+# Start with a low number (2-5) as this is very resource-intensive.
+MAX_WORKERS = 4
+
+# Custom User-Agent for requests
+HEADERS = {
     'User-Agent': 'PodcastDatasetCrawler-AudioResearch/1.0'
 }
 
-
-# --- Initialization ---
-os.makedirs(DOWNLOAD_DIRECTORY, exist_ok=True)
-
-# 2. This function processes a SINGLE line. It will be run on a worker thread.
-def process_line(line):
-    """Takes one line of the jsonl file, fetches headers, and returns the result."""
+def download_and_convert(line_data):
+    """
+    Takes one line of the jsonl file, downloads the audio, converts it to a
+    standard 24000 Hz sample rate MP3, and returns the result.
+    """
     try:
-        episode = json.loads(line)
+        episode = json.loads(line_data)
         episode_id = episode.get('id')
         url = episode.get('enclosure_url')
 
         if not episode_id or not url:
-            return None # Skip invalid lines
+            return None
 
-        response = requests.head(url, timeout=20, allow_redirects=True, headers=headers)
-        
-        file_size = 0
-        if response.status_code == 200:
-            file_size = int(response.headers.get('content-length', 0))
-        
-        # Return a tuple with all the necessary info
-        return (episode_id, response.status_code, file_size)
+        # Define paths for the final output and a temporary original file
+        final_path = os.path.join(DOWNLOAD_DIRECTORY, f"{episode_id}.mp3")
+        temp_original_path = os.path.join(DOWNLOAD_DIRECTORY, f"{episode_id}_original.tmp")
 
-    except (json.JSONDecodeError, requests.exceptions.RequestException):
-        # If anything goes wrong, return None so it can be skipped.
+        # --- 1. Download the Original File ---
+        with requests.get(url, headers=HEADERS, stream=True, timeout=60) as r:
+            r.raise_for_status() # Will raise an error for bad status codes
+            with open(temp_original_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        
+        # --- 2. Re-encode with FFmpeg ---
+        # This command converts the downloaded file to MP3 with a 24000 Hz sample rate
+        command = [
+            'ffmpeg',
+            '-i', temp_original_path, # Input file
+            '-ar', '24000',           # Set audio sample rate to 24000 Hz
+            '-ac', '1',               # Set audio channels to 1 (mono) for consistency
+            '-y',                     # Overwrite output file if it exists
+            final_path
+        ]
+
+        # Execute the FFmpeg command, hiding its output unless there's an error
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # --- 3. Cleanup and Return Result ---
+        final_size = os.path.getsize(final_path)
+        os.remove(temp_original_path) # Delete the larger original file
+
+        return (episode_id, final_size)
+
+    except (json.JSONDecodeError, requests.exceptions.RequestException, subprocess.CalledProcessError, FileNotFoundError) as e:
+        # If anything fails, clean up the temp file if it exists and return None
+        if 'temp_original_path' in locals() and os.path.exists(temp_original_path):
+            os.remove(temp_original_path)
+        # Using locals() to safely check if the variable was assigned
+        episode_id_for_error = json.loads(line_data).get('id', 'unknown')
+        print(f"❌ Error processing {episode_id_for_error}: {e}")
         return None
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
-    # Load previously processed IDs to avoid re-doing work
+    os.makedirs(DOWNLOAD_DIRECTORY, exist_ok=True)
+
+    # --- Load previously downloaded IDs to allow resuming ---
     processed_ids = set()
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE, 'r') as f:
             processed_ids = set(line.strip().split(',')[0] for line in f)
-    print(f"✅ Found {len(processed_ids)} previously processed IDs. Resuming...")
+    print(f"✅ Found {len(processed_ids):,} previously downloaded episodes. Resuming...")
 
-    # Read all lines from the source file that need processing
+    # --- Read all lines from the source file that need processing ---
+    lines_to_process = []
     with open(JSONL_FILE_PATH, 'r') as f:
-        lines_to_process = [line for line in f if json.loads(line).get('id') not in processed_ids]
+        for line in f:
+            try:
+                # A quick check to avoid re-parsing JSON for every line
+                peek_id = line[8:30]
+                if peek_id not in processed_ids:
+                    lines_to_process.append(line)
+            except Exception:
+                continue
 
-    print(f"📰 Found {len(lines_to_process):,} new episodes to process.")
+    if not lines_to_process:
+        print("🎉 No new episodes to process. All done!")
+        exit()
+        
+    print(f"📰 Found {len(lines_to_process):,} new episodes to download and convert with {MAX_WORKERS} workers.")
 
-    # Initialize counters
-    total_size_bytes = 0
-    podcasts_processed = 0
-    valid_podcasts = 0
+    # --- Initialize counters for this run ---
+    total_size_bytes_converted = 0
+    podcasts_processed_this_run = 0
     
-    # 3. Use ThreadPoolExecutor to process lines in parallel
+    # --- Use ThreadPoolExecutor to process files in parallel ---
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Use executor.map to apply the function to each line. This starts all threads.
-        future_to_line = executor.map(process_line, lines_to_process)
+        future_to_line = executor.map(download_and_convert, lines_to_process)
 
-        # 4. Process results as they are completed
+        # --- Process results as they are completed ---
         with open(LOG_FILE, 'a') as log:
             for result in future_to_line:
-                if result is None:
-                    continue # Skip lines that failed to parse or connect
-
-                podcasts_processed += 1
-                episode_id, status_code, file_size = result
+                podcasts_processed_this_run += 1
                 
-                if status_code == 200:
-                    valid_podcasts += 1
-                    total_size_bytes += file_size
-                
-                # Write to log immediately
-                log.write(f"{episode_id},{file_size}\n")
-                log.flush()
+                if result:
+                    episode_id, final_size = result
+                    total_size_bytes_converted += final_size
+                    log.write(f"{episode_id},{final_size}\n")
+                    log.flush()
 
-                # Print progress update
-                if podcasts_processed % 100 == 0:
-                    print(f"Processed {podcasts_processed}/{len(lines_to_process)} episodes...")
+                # Print a progress update every 10 episodes
+                if podcasts_processed_this_run % 10 == 0:
+                    print(f"   Processed {podcasts_processed_this_run:,}/{len(lines_to_process):,} episodes...")
 
     # --- Display Final Totals ---
-    print("\n🎉 Simulation complete!")
-    total_gb = total_size_bytes / 1024 / 1024 / 1024
-    total_tb = total_gb / 1024
-    success_rate = (valid_podcasts / podcasts_processed * 100) if podcasts_processed > 0 else 0
+    print("\n🎉 Download and conversion complete!")
+    total_gb = total_size_bytes_converted / 1024 / 1024 / 1024
 
-    print("\n--- Summary for this run ---")
-    print(f"Podcasts Processed: {podcasts_processed:,}")
-    print(f"Valid (200 OK) Podcasts: {valid_podcasts:,}")
-    print(f"Success Rate: {success_rate:.2f}%")
+    print("\n--- Summary for This Run ---")
+    print(f"Episodes Processed: {podcasts_processed_this_run:,}")
+    print(f"Successful Downloads & Conversions: {len(os.listdir(DOWNLOAD_DIRECTORY)) - 1}") # -1 for the log file
     print("---")
-    print(f"Total Scanned Size: {total_gb:,.2f} GB ({total_tb:,.2f} TB)")
+    print(f"Total Size of Converted Audio: {total_gb:,.2f} GB")
