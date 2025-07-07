@@ -100,9 +100,8 @@ def main():
             tasks_to_claim = [task['Key'] for task in response['Contents']]
         
         if not tasks_to_claim:
-            print("No tasks found. Sleeping for 60 seconds...")
-            time.sleep(60)
-            continue
+            print("No more tasks found. Stopping...")
+            break
 
         claimed_tasks = []
         for task_key in tasks_to_claim:
