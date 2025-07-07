@@ -19,7 +19,7 @@ LOCAL_TEMP_DIR = 'temp_processing'
 HEADERS = {'User-Agent': 'PodcastDatasetCrawler-AudioResearch/1.0'}
 
 # Set the number of internal worker threads to match the vCPUs of a c5.4xlarge
-MAX_WORKERS = 16 
+MAX_WORKERS = 2
 
 # Boto3 S3 client will be created in the main block
 s3_client = boto3.client('s3')
