@@ -12,7 +12,7 @@ S3_TODO_PREFIX = 'tasks/todo/'
 S3_IN_PROGRESS_PREFIX = 'tasks/in_progress/'
 S3_COMPLETED_PREFIX = 'tasks/completed/'
 S3_FAILED_PREFIX = 'tasks/failed/'
-S3_OUTPUT_PREFIX = 'converted-flac-audio/'
+S3_OUTPUT_PREFIX = 'raw-audio/'
 
 # The EC2 instance has temporary local storage we'll use for processing
 LOCAL_TEMP_DIR = 'temp_processing'
