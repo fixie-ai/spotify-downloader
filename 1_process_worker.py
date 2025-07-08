@@ -4,7 +4,8 @@ import requests
 import subprocess
 import time
 import random
-import concurrent.futures
+import multiprocessing
+from botocore.exceptions import ClientError
 
 # --- Configuration ---
 S3_BUCKET_NAME = 'sptfy-dataset'  # 👈 The name of your S3 bucket
@@ -17,33 +18,65 @@ S3_OUTPUT_PREFIX = 'raw-audio/'
 LOCAL_TEMP_DIR = 'temp_processing'
 HEADERS = {'User-Agent': 'PodcastDatasetCrawler-AudioResearch/1.0'}
 
-# Set the number of internal worker threads to match the vCPUs of your instance
-MAX_WORKERS = 16 
+# Set the number of concurrent worker PROCESSES.
+# A 1.5x ratio to vCPUs is a strong starting point for mixed workloads.
+# For a c5.4xlarge (16 vCPUs), 24 is a good value.
+NUM_WORKERS = 8
 
-s3_client = boto3.client('s3')
+# If the fleet encounters this many consecutive critical failures, all workers on this instance will shut down.
+MAX_CONSECUTIVE_FAILURES = 20
+# How many times a worker should fail to find a task before shutting down.
+IDLE_CHECK_THRESHOLD = 2
 
-def claim_and_move_task(source_key):
-    """Atomically moves a single task file. Returns the new key or None on failure."""
-    try:
-        episode_id = os.path.basename(source_key).replace('.task', '')
-        in_progress_key = f"{S3_IN_PROGRESS_PREFIX}{episode_id}.task"
+# Boto3 clients are not safe to share across processes, so each worker will create its own.
 
-        s3_client.copy_object(
-            Bucket=S3_BUCKET_NAME,
-            CopySource={'Bucket': S3_BUCKET_NAME, 'Key': source_key},
-            Key=in_progress_key
-        )
-        s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=source_key)
-        
-        return in_progress_key
-    except Exception:
+def claim_task():
+    """
+    Lists tasks in the 'todo' folder and attempts to atomically move one
+    to the 'in_progress' folder. Returns the new key or None on failure.
+    """
+    # Each process needs its own client
+    s3_client = boto3.client('s3')
+    
+    # List more tasks than we strictly need in case of contention
+    response = s3_client.list_objects_v2(Bucket=S3_BUCKET_NAME, Prefix=S3_TODO_PREFIX, MaxKeys=50)
+    if 'Contents' not in response:
         return None
+
+    tasks = response['Contents']
+    random.shuffle(tasks) # Randomize to reduce contention between workers
+
+    for task in tasks:
+        source_key = task['Key']
+        try:
+            episode_id = os.path.basename(source_key).replace('.task', '')
+            in_progress_key = f"{S3_IN_PROGRESS_PREFIX}{episode_id}.task"
+
+            # Atomic Move: Copy the object, then delete the original.
+            s3_client.copy_object(
+                Bucket=S3_BUCKET_NAME,
+                CopySource={'Bucket': S3_BUCKET_NAME, 'Key': source_key},
+                Key=in_progress_key
+            )
+            s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=source_key)
+            
+            return in_progress_key
+        except ClientError as e:
+            # This is an expected race condition if another worker claimed the file.
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                continue
+            else:
+                raise # Re-raise other unexpected S3 errors
+    return None
+
 
 def process_task(task_key):
     """
-    The core work function for a single thread.
-    Downloads, converts, and uploads a single podcast based on a task file.
+    The core work function for a single task.
+    Downloads, converts, and uploads a single podcast.
+    Returns True on success, False on failure.
     """
+    s3_client = boto3.client('s3')
     episode_id = os.path.basename(task_key).replace('.task', '')
     final_local_path = os.path.join(LOCAL_TEMP_DIR, f"{episode_id}.flac")
     temp_original_path = os.path.join(LOCAL_TEMP_DIR, f"{episode_id}_original.tmp")
@@ -64,72 +97,94 @@ def process_task(task_key):
         final_s3_key = f"{S3_OUTPUT_PREFIX}{episode_id}.flac"
         s3_client.upload_file(final_local_path, S3_BUCKET_NAME, final_s3_key)
         
-        # --- Defensive Finalization (Success) ---
+        # Defensive Finalization (Success)
         try:
             completed_key = f"{S3_COMPLETED_PREFIX}{episode_id}.task"
             s3_client.copy_object(Bucket=S3_BUCKET_NAME, CopySource={'Bucket': S3_BUCKET_NAME, 'Key': task_key}, Key=completed_key)
             s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=task_key)
-            print(f"✅ Completed: {episode_id}")
-        except s3_client.exceptions.NoSuchKey:
-            # This is safe. It means another worker finished this task while we were working.
-            print(f"⚠️ Note: Task {episode_id} was already completed by another worker.")
+            print(f"🎉 Completed: {episode_id}")
+            return True # Indicate success
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                print(f"⚠️ Note: Task {episode_id} was already completed by another worker.")
+                return True # Treat as success
+            else:
+                raise
 
     except Exception as e:
         print(f"❌ FAILED: {episode_id}. Error: {e}")
-        # --- Defensive Finalization (Failure) ---
+        # Defensive Finalization (Failure)
         try:
             failed_key = f"{S3_FAILED_PREFIX}{episode_id}.task"
             s3_client.copy_object(Bucket=S3_BUCKET_NAME, CopySource={'Bucket': S3_BUCKET_NAME, 'Key': task_key}, Key=failed_key)
             s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=task_key)
-        except s3_client.exceptions.NoSuchKey:
-            # Another worker might have also failed on this task and moved it already.
-             print(f"⚠️ Note: Failed task {episode_id} was already moved by another worker.")
-        except Exception as move_err:
-            print(f"❌ Critical error: Could not move failed task {episode_id}. Error: {move_err}")
-
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                 print(f"⚠️ Note: Failed task {episode_id} was already moved by another worker.")
+            else:
+                print(f"❌ Critical error: Could not move failed task {episode_id}. Error: {e}")
+        return False # Indicate failure
     finally:
-        # Cleanup local files regardless of success or failure
+        # Cleanup local files
         if os.path.exists(temp_original_path): os.remove(temp_original_path)
         if os.path.exists(final_local_path): os.remove(final_local_path)
 
 
+def worker_job(rank, failure_counter, lock):
+    """
+    The main loop for a single worker PROCESS. It continuously tries to claim and
+    process tasks until it can't find any or the circuit breaker trips.
+    """
+    print(f"--- Worker-{rank} started (PID: {os.getpid()}) ---")
+    idle_checks = 0
+    while idle_checks < IDLE_CHECK_THRESHOLD:
+        if failure_counter.value >= MAX_CONSECUTIVE_FAILURES:
+            print(f"--- Worker-{rank}: Circuit breaker tripped! Shutting down. ---")
+            break
+
+        task_key = claim_task()
+        if task_key:
+            idle_checks = 0 # Reset idle counter on finding work
+            success = process_task(task_key)
+            if success:
+                # On success, reset the shared failure counter
+                failure_counter.value = 0
+            else:
+                # On failure, use the shared lock to safely increment the counter
+                with lock:
+                    failure_counter.value += 1
+        else:
+            # If no tasks are found, increment the idle counter and wait
+            idle_checks += 1
+            print(f"   Worker-{rank} idle (check {idle_checks}/{IDLE_CHECK_THRESHOLD})... sleeping.")
+            time.sleep(30 + random.uniform(0, 30)) # Sleep with jitter
+    
+    print(f"--- Worker-{rank} shutting down after {IDLE_CHECK_THRESHOLD} idle checks. ---")
+
+
 def main():
     """
-    Main worker loop that processes tasks in batches using a thread pool.
+    Initializes and runs the multiprocessing pool.
     """
     os.makedirs(LOCAL_TEMP_DIR, exist_ok=True)
-    print(f"--- Worker started. Concurrency level: {MAX_WORKERS} threads. ---")
     
-    while True:
-        print("🔍 Searching for a batch of tasks...")
-        tasks_to_claim = []
-        response = s3_client.list_objects_v2(Bucket=S3_BUCKET_NAME, Prefix=S3_TODO_PREFIX, MaxKeys=MAX_WORKERS * 2)
+    # Use a Manager to create shared objects that can be passed between processes
+    with multiprocessing.Manager() as manager:
+        failure_counter = manager.Value('i', 0)
+        lock = manager.Lock() # Create a shared lock
         
-        if 'Contents' in response:
-            tasks_to_claim = [task['Key'] for task in response['Contents']]
+        print(f"--- Main process started. Launching {NUM_WORKERS} worker processes. ---")
         
-        if not tasks_to_claim:
-            print("No tasks found. Sleeping for 60 seconds...")
-            time.sleep(60)
-            continue
+        with multiprocessing.Pool(processes=NUM_WORKERS) as pool:
+            # Create a list of arguments for each worker, including the shared lock
+            worker_args = [(i, failure_counter, lock) for i in range(NUM_WORKERS)]
+            # Map each worker process to the worker_job function with its arguments
+            pool.starmap(worker_job, worker_args)
 
-        claimed_tasks = []
-        for task_key in tasks_to_claim:
-            if len(claimed_tasks) >= MAX_WORKERS:
-                break
-            moved_key = claim_and_move_task(task_key)
-            if moved_key:
-                claimed_tasks.append(moved_key)
-        
-        if not claimed_tasks:
-            continue
-
-        print(f"⚙️ Processing a batch of {len(claimed_tasks)} tasks...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            list(executor.map(process_task, claimed_tasks))
-        
-        print("--- Batch complete. Looking for more tasks. ---")
-
+    print("🏁 All worker processes have completed. Main process exiting. Goodbye!")
 
 if __name__ == "__main__":
+    # For Linux/macOS, 'fork' is efficient. For Windows/macOS, 'spawn' is safer.
+    # We force 'fork' here assuming a Linux EC2 environment.
+    multiprocessing.set_start_method("fork", force=True)
     main()
