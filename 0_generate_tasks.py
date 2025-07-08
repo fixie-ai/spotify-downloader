@@ -8,12 +8,12 @@ S3_KEY_FOR_JSONL = 'source-data/spotify_podcast_data.jsonl'  # 👈 The "path" t
 
 # Define all prefixes where tasks could possibly exist
 TASK_PREFIXES_TO_CHECK = [
-    'tasks/todo/',
-    'tasks/in_progress/',
-    'tasks/completed/',
-    'tasks/failed/'
+    'tasks/download_todo/',
+    'tasks/download_in_progress/',
+    'tasks/download_completed/',
+    'tasks/download_failed/'
 ]
-S3_TODO_PREFIX = 'tasks/todo/'
+S3_TODO_PREFIX = 'tasks/download_todo/'
 
 # Initialize Boto3 S3 client
 s3_client = boto3.client('s3')
