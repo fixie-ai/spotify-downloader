@@ -3,7 +3,7 @@ import boto3
 import os
 
 # --- Configuration ---
-S3_BUCKET_NAME = 'sptfy-dataset'  # 👈 The name of your S3 bucket
+S3_BUCKET_NAME = 'spotify-dataset'  # 👈 The name of your S3 bucket
 S3_KEY_FOR_JSONL = 'source-data/spotify_podcast_data.jsonl'  # 👈 The "path" to the jsonl file
 
 # Define all prefixes where tasks could possibly exist
