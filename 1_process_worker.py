@@ -9,7 +9,7 @@ from botocore.exceptions import ClientError
 from urllib.parse import urlparse
 
 # --- Configuration ---
-S3_BUCKET_NAME = 'spotify-dataset'
+S3_BUCKET_NAME = 'sptfy-dataset'
 S3_TODO_PREFIX = 'tasks/download_todo/'
 S3_IN_PROGRESS_PREFIX = 'tasks/download_in_progress/'
 S3_COMPLETED_PREFIX = 'tasks/download_completed/'
