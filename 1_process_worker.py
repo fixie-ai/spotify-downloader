@@ -21,7 +21,7 @@ HEADERS = {'User-Agent': 'PodcastDatasetCrawler-AudioResearch/1.0'}
 
 # Since the task is now purely network I/O bound, we can handle more concurrent workers.
 # Adjust based on instance type and network performance.
-NUM_WORKERS = 24
+NUM_WORKERS = 8
 
 MAX_CONSECUTIVE_FAILURES = 20
 IDLE_CHECK_THRESHOLD = 5
