@@ -6,9 +6,10 @@ import time
 import random
 import multiprocessing
 from botocore.exceptions import ClientError
+from urllib.parse import urlparse
 
 # --- Configuration ---
-S3_BUCKET_NAME = 'sptfy-dataset'  # 👈 The name of your S3 bucket
+S3_BUCKET_NAME = 'sptfy-dataset'
 S3_TODO_PREFIX = 'tasks/download_todo/'
 S3_IN_PROGRESS_PREFIX = 'tasks/download_in_progress/'
 S3_COMPLETED_PREFIX = 'tasks/download_completed/'
@@ -18,15 +19,12 @@ S3_OUTPUT_PREFIX = 'raw-audio/'
 LOCAL_TEMP_DIR = 'temp_processing'
 HEADERS = {'User-Agent': 'PodcastDatasetCrawler-AudioResearch/1.0'}
 
-# Set the number of concurrent worker PROCESSES.
-# A 1.5x ratio to vCPUs is a strong starting point for mixed workloads.
-# For a c5.4xlarge (16 vCPUs), 24 is a good value.
-NUM_WORKERS = 8
+# Since the task is now purely network I/O bound, we can handle more concurrent workers.
+# Adjust based on instance type and network performance.
+NUM_WORKERS = 24
 
-# If the fleet encounters this many consecutive critical failures, all workers on this instance will shut down.
 MAX_CONSECUTIVE_FAILURES = 20
-# How many times a worker should fail to find a task before shutting down.
-IDLE_CHECK_THRESHOLD = 2
+IDLE_CHECK_THRESHOLD = 5
 
 # Boto3 clients are not safe to share across processes, so each worker will create its own.
 
@@ -35,16 +33,14 @@ def claim_task():
     Lists tasks in the 'todo' folder and attempts to atomically move one
     to the 'in_progress' folder. Returns the new key or None on failure.
     """
-    # Each process needs its own client
     s3_client = boto3.client('s3')
     
-    # List more tasks than we strictly need in case of contention
     response = s3_client.list_objects_v2(Bucket=S3_BUCKET_NAME, Prefix=S3_TODO_PREFIX, MaxKeys=50)
     if 'Contents' not in response:
         return None
 
     tasks = response['Contents']
-    random.shuffle(tasks) # Randomize to reduce contention between workers
+    random.shuffle(tasks)
 
     for task in tasks:
         source_key = task['Key']
@@ -52,7 +48,6 @@ def claim_task():
             episode_id = os.path.basename(source_key).replace('.task', '')
             in_progress_key = f"{S3_IN_PROGRESS_PREFIX}{episode_id}.task"
 
-            # Atomic Move: Copy the object, then delete the original.
             s3_client.copy_object(
                 Bucket=S3_BUCKET_NAME,
                 CopySource={'Bucket': S3_BUCKET_NAME, 'Key': source_key},
@@ -62,47 +57,54 @@ def claim_task():
             
             return in_progress_key
         except ClientError as e:
-            # This is an expected race condition if another worker claimed the file.
             if e.response['Error']['Code'] == 'NoSuchKey':
                 continue
             else:
-                raise # Re-raise other unexpected S3 errors
+                raise
     return None
 
 
 def process_task(task_key):
     """
     The core work function for a single task.
-    Downloads, converts, and uploads a single podcast.
+    Downloads the raw audio file and uploads it to S3.
     Returns True on success, False on failure.
     """
     s3_client = boto3.client('s3')
     episode_id = os.path.basename(task_key).replace('.task', '')
-    final_local_path = os.path.join(LOCAL_TEMP_DIR, f"{episode_id}.flac")
-    temp_original_path = os.path.join(LOCAL_TEMP_DIR, f"{episode_id}_original.tmp")
+    
+    local_download_path = None # Define here for the finally block
 
     try:
+        # 1. Get download URL and determine original file extension
         task_obj = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=task_key)
         url = task_obj['Body'].read().decode('utf-8')
         
+        # Get file extension from URL path (e.g., .mp3, .m4a)
+        path = urlparse(url).path
+        extension = os.path.splitext(path)[1]
+        if not extension:
+            extension = ".mp3" # Default to .mp3 if no extension found
+
+        local_download_path = os.path.join(LOCAL_TEMP_DIR, f"{episode_id}{extension}")
+        
+        # 2. Download the original file
         with requests.get(url, headers=HEADERS, stream=True, timeout=60) as r:
             r.raise_for_status()
-            with open(temp_original_path, 'wb') as f:
+            with open(local_download_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
         
-        command = ['ffmpeg', '-i', temp_original_path, '-ar', '24000', '-ac', '1', '-y', final_local_path]
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # 3. Upload the original file directly to S3
+        final_s3_key = f"{S3_OUTPUT_PREFIX}{episode_id}{extension}"
+        s3_client.upload_file(local_download_path, S3_BUCKET_NAME, final_s3_key)
         
-        final_s3_key = f"{S3_OUTPUT_PREFIX}{episode_id}.flac"
-        s3_client.upload_file(final_local_path, S3_BUCKET_NAME, final_s3_key)
-        
-        # Defensive Finalization (Success)
+        # 4. Defensive Finalization (Success)
         try:
             completed_key = f"{S3_COMPLETED_PREFIX}{episode_id}.task"
             s3_client.copy_object(Bucket=S3_BUCKET_NAME, CopySource={'Bucket': S3_BUCKET_NAME, 'Key': task_key}, Key=completed_key)
             s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=task_key)
-            print(f"🎉 Completed: {episode_id}")
+            print(f"🎉 Downloaded: {episode_id}{extension}")
             return True # Indicate success
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
@@ -113,7 +115,7 @@ def process_task(task_key):
 
     except Exception as e:
         print(f"❌ FAILED: {episode_id}. Error: {e}")
-        # Defensive Finalization (Failure)
+        # 5. Defensive Finalization (Failure)
         try:
             failed_key = f"{S3_FAILED_PREFIX}{episode_id}.task"
             s3_client.copy_object(Bucket=S3_BUCKET_NAME, CopySource={'Bucket': S3_BUCKET_NAME, 'Key': task_key}, Key=failed_key)
@@ -125,9 +127,9 @@ def process_task(task_key):
                 print(f"❌ Critical error: Could not move failed task {episode_id}. Error: {e}")
         return False # Indicate failure
     finally:
-        # Cleanup local files
-        if os.path.exists(temp_original_path): os.remove(temp_original_path)
-        if os.path.exists(final_local_path): os.remove(final_local_path)
+        # 6. Cleanup local download file
+        if local_download_path and os.path.exists(local_download_path):
+            os.remove(local_download_path)
 
 
 def worker_job(rank, failure_counter, lock):
@@ -168,23 +170,18 @@ def main():
     """
     os.makedirs(LOCAL_TEMP_DIR, exist_ok=True)
     
-    # Use a Manager to create shared objects that can be passed between processes
     with multiprocessing.Manager() as manager:
         failure_counter = manager.Value('i', 0)
-        lock = manager.Lock() # Create a shared lock
+        lock = manager.Lock() 
         
         print(f"--- Main process started. Launching {NUM_WORKERS} worker processes. ---")
         
         with multiprocessing.Pool(processes=NUM_WORKERS) as pool:
-            # Create a list of arguments for each worker, including the shared lock
             worker_args = [(i, failure_counter, lock) for i in range(NUM_WORKERS)]
-            # Map each worker process to the worker_job function with its arguments
             pool.starmap(worker_job, worker_args)
 
     print("🏁 All worker processes have completed. Main process exiting. Goodbye!")
 
 if __name__ == "__main__":
-    # For Linux/macOS, 'fork' is efficient. For Windows/macOS, 'spawn' is safer.
-    # We force 'fork' here assuming a Linux EC2 environment.
     multiprocessing.set_start_method("fork", force=True)
     main()
